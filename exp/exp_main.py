@@ -1,0 +1,791 @@
+import os
+import time
+import warnings
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import optim
+from data_provider.data_factory import data_provider
+from exp.exp_basic import Exp_Basic
+from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from utils.metrics import metric
+from tqdm import tqdm
+from models import CQMTformer
+from models.Former import Autoformer,FEDformer,DRFormer,iTransformer,PatchTST
+from models.CNN import MICN
+from models.RNN import BiMamba4TS,S_Mamba
+from models.MLP import DLinear,Linear,NLinear,TimeMixer,TimesNet,TimeXer
+from models import Ablation3,Ablation4,Ablation5,Ablation6,Ablation7,Ablation8,Attention_look,attention1
+warnings.filterwarnings('ignore')
+
+class Exp_Main(Exp_Basic):
+    def __init__(self, args):
+        super(Exp_Main, self).__init__(args)
+
+    def _build_model(self):
+        model_dict = {
+            'FEDformer': FEDformer,
+            'Autoformer': Autoformer,
+            'iTransformer': iTransformer,
+            'PatchTST': PatchTST,
+            'DRFormer': DRFormer,
+            'BiMamba4TS': BiMamba4TS,
+            'S_Mamba':S_Mamba,
+            'DLinear': DLinear,
+            'Linear': Linear,
+            'NLinear': NLinear,
+            'MICN': MICN,
+            'TimeMixer': TimeMixer,
+            'TimeXer': TimeXer,
+            'TimesNet': TimesNet,
+            'CQMTformer': CQMTformer,
+            'Ablation3': Ablation3,
+            'Ablation4': Ablation4,
+            'Ablation5': Ablation5,
+            'Ablation6': Ablation6,
+            'Ablation7': Ablation7,
+            'Ablation8': Ablation8,
+            'Attention_look': Attention_look,
+            'attention1':attention1,
+        }
+        model = model_dict[self.args.model].Model(self.args).float()
+
+        if self.args.use_multi_gpu and self.args.use_gpu:
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
+        return model
+
+    def _get_data(self, flag):
+        data_set, data_loader = data_provider(self.args, flag)
+        return data_set, data_loader
+
+    def _select_optimizer(self):
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        return model_optim
+
+    def _select_criterion(self):
+        criterion = nn.MSELoss()
+        return criterion
+
+    def _count_parameters(self, model):
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        return total_params, trainable_params
+
+    def _get_task_id_path(self, base_dir, setting):
+        task_id = getattr(self.args, 'task_id', 'default_task')
+        task_path = os.path.join(base_dir, f'task_{task_id}', setting)
+        return task_path
+
+    def _save_model_info(self, setting, model):
+        total_params, trainable_params = self._count_parameters(model)
+
+        info_dir = self._get_task_id_path('./model_info/', setting)
+        if not os.path.exists(info_dir):
+            os.makedirs(info_dir)
+
+        info_file = os.path.join(info_dir, 'model_info.txt')
+        with open(info_file, 'w') as f:
+            f.write(f"Task ID: {getattr(self.args, 'task_id', 'default_task')}\n")
+            f.write(f"Model Architecture: {self.args.model}\n")
+            f.write(f"Setting: {setting}\n")
+            f.write(f"Total Parameters: {total_params:,}\n")
+            f.write(f"Trainable Parameters: {trainable_params:,}\n")
+            f.write(f"Non-trainable Parameters: {total_params - trainable_params:,}\n")
+            f.write(f"Parameter Size: {total_params * 4 / (1024 ** 2):.2f} MB (FP32)\n")
+            f.write(f"Input Length: {self.args.seq_len}\n")
+            f.write(f"Prediction Length: {self.args.pred_len}\n")
+            f.write(f"Features: {self.args.features}\n")
+            f.write(f"Enc Layers: {getattr(self.args, 'e_layers', 'N/A')}\n")
+            f.write(f"Dec Layers: {getattr(self.args, 'd_layers', 'N/A')}\n")
+            f.write(f"d_model: {getattr(self.args, 'd_model', 'N/A')}\n")
+            f.write(f"d_ff: {getattr(self.args, 'd_ff', 'N/A')}\n")
+            f.write(f"n_heads: {getattr(self.args, 'n_heads', 'N/A')}\n")
+            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        summary_dir = self._get_task_id_path('./model_info/', '')
+        if not os.path.exists(summary_dir):
+            os.makedirs(summary_dir)
+        summary_file = os.path.join(summary_dir, 'models_summary.txt')
+        with open(summary_file, 'a') as f:
+            f.write(
+                f"{setting:<50} | {self.args.model:<15} | {total_params:>12,} | {trainable_params:>12,} | {total_params * 4 / (1024 ** 2):>8.2f} MB | {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        return total_params, trainable_params
+
+    def _calculate_gflops(self, model, input_data, device='cpu'):
+        """
+        Calculate GFLOPs for the model using a deep copy to avoid modifying the original model.
+        
+        Args:
+            model: The neural network model
+            input_data: Tuple of input tensors (batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            device: Device to use for calculation ('cpu' or 'cuda')
+        
+        Returns:
+            GFLOPs value (billions of floating point operations)
+        """
+        from thop import profile
+        import copy
+        
+        # Create a deep copy of the model to avoid polluting the original with thop attributes
+        try:
+            # Try to create a deep copy (may fail for complex models with custom layers)
+            model_copy = copy.deepcopy(model)
+        except:
+            # If deep copy fails, we'll use the original but clean up later
+            print("    Warning: Cannot deep copy model, using original (may cause issues)")
+            model_copy = model
+        
+        # Move model copy to target device
+        model_copy = model_copy.to(device)
+        model_copy.eval()
+        
+        # Move input data to target device
+        input_data_device = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in input_data)
+        
+        gflops = -1.0
+        try:
+            # Calculate FLOPs with custom hook handling
+            flops, params = profile(
+                model_copy, 
+                inputs=input_data_device, 
+                verbose=False,
+                custom_ops={}  # Use default hooks
+            )
+            
+            # Convert to GFLOPs (1 GFLOP = 10^9 FLOPs)
+            gflops = flops / 1e9
+            
+        except Exception as e:
+            print(f"    FLOPs calculation failed: {e}")
+            gflops = -1.0
+        finally:
+            # Clean up: delete the copy to free memory
+            if model_copy is not model:
+                del model_copy
+            if device == 'cuda' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return gflops
+
+    def _calculate_gflops_alternative(self, model, input_data):
+        """
+        Alternative GFLOPs calculation using ptflops (more robust for complex models).
+        
+        Args:
+            model: The neural network model
+            input_data: Tuple of input tensors (batch_x, batch_x_mark, dec_inp, batch_y_mark)
+        
+        Returns:
+            GFLOPs value (billions of floating point operations)
+        """
+        try:
+            from ptflops import get_model_complexity_info
+            
+            # Get input shape from the first tensor (batch_x)
+            input_shape = input_data[0].shape[1:]  # (seq_len, features)
+            
+            # Create a wrapper for models that require multiple inputs
+            class ModelWrapper(nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+                
+                def forward(self, x):
+                    # Create dummy tensors for other inputs
+                    batch_size = x.shape[0]
+                    batch_x_mark = torch.zeros(batch_size, input_data[1].shape[1], input_data[1].shape[2])
+                    dec_inp = torch.zeros(batch_size, input_data[2].shape[1], input_data[2].shape[2])
+                    batch_y_mark = torch.zeros(batch_size, input_data[3].shape[1], input_data[3].shape[2])
+                    
+                    return self.model(x, batch_x_mark, dec_inp, batch_y_mark)
+            
+            wrapped_model = ModelWrapper(model)
+            wrapped_model.eval()
+            
+            # Calculate FLOPs
+            macs, params = get_model_complexity_info(
+                wrapped_model, 
+                input_shape, 
+                as_strings=False,
+                print_per_layer_stat=False
+            )
+            
+            # Convert MACs to FLOPs (1 MAC = 2 FLOPs typically)
+            gflops = (macs * 2) / 1e9
+            
+            return gflops
+            
+        except ImportError:
+            print("    ptflops not available, skipping alternative method")
+            return -1.0
+        except Exception as e:
+            print(f"    Alternative FLOPs calculation failed: {e}")
+            return -1.0
+
+    def _measure_inference_time(self, model, test_loader, num_iterations=100):
+        """
+        Measure average inference time.
+        
+        Args:
+            model: The neural network model
+            test_loader: DataLoader for test data
+            num_iterations: Number of iterations to average over
+        
+        Returns:
+            Average inference time in milliseconds
+        """
+        model.eval()
+        
+        # Get a single batch for consistent measurement
+        batch_x, batch_y, batch_x_mark, batch_y_mark = next(iter(test_loader))
+        batch_x = batch_x.float().to(self.device)
+        batch_y = batch_y.float().to(self.device)
+        batch_x_mark = batch_x_mark.float().to(self.device)
+        batch_y_mark = batch_y_mark.float().to(self.device)
+        
+        # Prepare decoder input
+        dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+        dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+        
+        # Warm-up runs to initialize CUDA
+        with torch.no_grad():
+            for _ in range(10):
+                if self.args.output_attention:
+                    _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                else:
+                    _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+        
+        # Synchronize GPU before timing
+        if self.args.use_gpu:
+            torch.cuda.synchronize()
+        
+        # Measure inference time
+        start_time = time.time()
+        with torch.no_grad():
+            for _ in range(num_iterations):
+                if self.args.output_attention:
+                    _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                else:
+                    _ = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+        
+        # Synchronize GPU after timing
+        if self.args.use_gpu:
+            torch.cuda.synchronize()
+        
+        end_time = time.time()
+        
+        # Calculate average inference time in milliseconds
+        avg_time = (end_time - start_time) / num_iterations * 1000
+        
+        return avg_time
+
+    def benchmark_performance(self, setting, test_loader):
+        """
+        Run comprehensive performance benchmarks including parameters, GFLOPs, and inference time.
+        
+        Args:
+            setting: Experiment setting string
+            test_loader: DataLoader for test data
+        
+        Returns:
+            Dictionary with benchmark results
+        """
+        print("\n" + "=" * 80)
+        print("PERFORMANCE BENCHMARK")
+        print("=" * 80)
+        
+        # 1. Count parameters
+        total_params, trainable_params = self._count_parameters(self.model)
+        non_trainable_params = total_params - trainable_params
+        param_size_mb = total_params * 4 / (1024 ** 2)  # FP32
+        
+        print(f"\n[1] MODEL PARAMETERS:")
+        print(f"    Total Parameters:       {total_params:>12,}")
+        print(f"    Trainable Parameters:   {trainable_params:>12,}")
+        print(f"    Non-trainable Params:   {non_trainable_params:>12,}")
+        print(f"    Model Size (FP32):      {param_size_mb:>12.2f} MB")
+        
+        # 2. Calculate GFLOPs
+        print(f"\n[2] COMPUTATIONAL COMPLEXITY:")
+        
+        # Get a batch of data
+        batch_x, batch_y, batch_x_mark, batch_y_mark = next(iter(test_loader))
+        batch_x = batch_x.float()
+        batch_y = batch_y.float()
+        batch_x_mark = batch_x_mark.float()
+        batch_y_mark = batch_y_mark.float()
+        
+        # Prepare decoder input
+        dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+        dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float()
+        
+        input_data = (batch_x, batch_x_mark, dec_inp, batch_y_mark)
+        
+        gflops = -1.0
+        
+        # Try GPU calculation first (more likely to work for CUDA-specific operations)
+        if self.args.use_gpu:
+            try:
+                print("    Calculating GFLOPs on GPU...")
+                gflops = self._calculate_gflops(self.model, input_data, device='cuda')
+                if gflops > 0:
+                    print(f"    GFLOPs:                 {gflops:>12.4f} G")
+                else:
+                    print(f"    GFLOPs calculation returned {gflops}")
+            except Exception as e:
+                print(f"    GPU GFLOPs calculation failed: {e}")
+        
+        # If GPU calculation failed or gave invalid result, try CPU
+        if gflops <= 0:
+            try:
+                print("    Attempting GFLOPs calculation on CPU...")
+                gflops = self._calculate_gflops(self.model, input_data, device='cpu')
+                if gflops > 0:
+                    print(f"    GFLOPs (CPU):           {gflops:>12.4f} G")
+                else:
+                    print(f"    GFLOPs calculation on CPU failed")
+            except Exception as e:
+                print(f"    CPU GFLOPs calculation failed: {e}")
+        
+        # If both failed, try alternative method
+        if gflops <= 0:
+            try:
+                print("    Attempting alternative GFLOPs calculation...")
+                gflops = self._calculate_gflops_alternative(self.model, input_data)
+                if gflops > 0:
+                    print(f"    GFLOPs (alternative):   {gflops:>12.4f} G")
+                else:
+                    print(f"    Alternative calculation failed")
+            except Exception as e:
+                print(f"    Alternative GFLOPs calculation failed: {e}")
+        
+        if gflops <= 0:
+            print(f"    GFLOPs:                 {'Failed to calculate':>12}")
+        
+        # 3. Measure inference time
+        print(f"\n[3] INFERENCE SPEED:")
+        try:
+            avg_inference_time = self._measure_inference_time(self.model, test_loader)
+            fps = 1000 / avg_inference_time if avg_inference_time > 0 else 0
+            print(f"    Average Inference Time: {avg_inference_time:>12.4f} ms")
+            print(f"    Frames Per Second:      {fps:>12.2f} fps")
+        except Exception as e:
+            print(f"    Inference time measurement failed: {e}")
+            avg_inference_time = -1
+            fps = -1
+        
+        # Save benchmark results to file
+        benchmark_dir = self._get_task_id_path('./benchmark_results/', setting)
+        if not os.path.exists(benchmark_dir):
+            os.makedirs(benchmark_dir)
+        
+        benchmark_file = os.path.join(benchmark_dir, 'performance_benchmark.txt')
+        with open(benchmark_file, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("MODEL PERFORMANCE BENCHMARK\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Task ID: {getattr(self.args, 'task_id', 'default_task')}\n")
+            f.write(f"Model: {self.args.model}\n")
+            f.write(f"Setting: {setting}\n")
+            f.write(f"Device: {self.device}\n")
+            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            f.write("[1] MODEL PARAMETERS:\n")
+            f.write(f"    Total Parameters:       {total_params:>12,}\n")
+            f.write(f"    Trainable Parameters:   {trainable_params:>12,}\n")
+            f.write(f"    Non-trainable Params:   {non_trainable_params:>12,}\n")
+            f.write(f"    Model Size (FP32):      {param_size_mb:>12.2f} MB\n\n")
+            
+            f.write("[2] COMPUTATIONAL COMPLEXITY:\n")
+            if gflops > 0:
+                f.write(f"    GFLOPs:                 {gflops:>12.4f} G\n\n")
+            else:
+                f.write(f"    GFLOPs:                 {'Failed to calculate':>12}\n\n")
+            
+            f.write("[3] INFERENCE SPEED:\n")
+            f.write(f"    Average Inference Time: {avg_inference_time:>12.4f} ms\n")
+            f.write(f"    Frames Per Second:      {fps:>12.2f} fps\n")
+        
+        print(f"\nBenchmark results saved to: {benchmark_file}")
+        print("=" * 80)
+        
+        return {
+            'total_params': total_params,
+            'trainable_params': trainable_params,
+            'gflops': gflops if gflops > 0 else -1.0,
+            'inference_time_ms': avg_inference_time,
+            'fps': fps
+        }
+
+    def vali(self, vali_data, vali_loader, criterion):
+        total_loss = []
+        self.model.eval()
+
+        val_pbar = tqdm(total=len(vali_loader), desc='Validating', leave=False)
+
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float()
+
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                f_dim = -1 if self.args.features == 'MS' else 0
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+                pred = outputs.detach().cpu()
+                true = batch_y.detach().cpu()
+
+                loss = criterion(pred, true)
+                total_loss.append(loss.item())
+
+                val_pbar.update(1)
+
+        val_pbar.close()
+        total_loss = np.average(total_loss)
+        self.model.train()
+        return total_loss
+
+    def train(self, setting):
+        total_params, trainable_params = self._save_model_info(setting, self.model)
+
+        print("\n" + "=" * 80)
+        print("MODEL PARAMETER INFORMATION:")
+        print(f"Task ID: {getattr(self.args, 'task_id', 'default_task')}")
+        print(f"Model: {self.args.model}")
+        print(f"Total Parameters: {total_params:,}")
+        print(f"Trainable Parameters: {trainable_params:,}")
+        print(f"Parameter Size: {total_params * 4 / (1024 ** 2):.2f} MB (FP32)")
+        print("=" * 80)
+
+        train_data, train_loader = self._get_data(flag='train')
+        vali_data, vali_loader = self._get_data(flag='val')
+        test_data, test_loader = self._get_data(flag='test')
+
+        path = self._get_task_id_path(self.args.checkpoints, setting)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        time_now = time.time()
+
+        train_steps = len(train_loader)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+
+        model_optim = self._select_optimizer()
+        criterion = self._select_criterion()
+
+        if self.args.use_amp:
+            scaler = torch.cuda.amp.GradScaler()
+
+        train_losses = []
+        val_losses = []
+        test_losses = []
+
+        epoch_pbar = tqdm(total=self.args.train_epochs, desc='Training Progress')
+
+        start_time = time.time()
+
+        print("\n" + "=" * 80)
+        print(f"{'Epoch':^6} | {'Train Loss':^12} | {'Val Loss':^12} | {'Test Loss':^12} | {'Time':^8} | {'ETA':^10}")
+        print("-" * 80)
+
+        for epoch in range(self.args.train_epochs):
+            iter_count = 0
+            train_loss = []
+
+            self.model.train()
+            epoch_time = time.time()
+
+            batch_pbar = tqdm(total=len(train_loader), desc=f'Epoch {epoch + 1}', leave=False)
+
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                iter_count += 1
+                model_optim.zero_grad()
+                batch_x = batch_x.float().to(self.device)
+
+                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        loss = criterion(outputs, batch_y)
+                        train_loss.append(loss.item())
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                    f_dim = -1 if self.args.features == 'MS' else 0
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+                    loss = criterion(outputs, batch_y)
+                    train_loss.append(loss.item())
+
+                batch_pbar.set_postfix({
+                    'loss': f'{loss.item():.6f}',
+                    'lr': f'{model_optim.param_groups[0]["lr"]:.6f}'
+                })
+                batch_pbar.update(1)
+
+                if (i + 1) % 100 == 0:
+                    speed = (time.time() - time_now) / iter_count
+                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                    batch_pbar.set_postfix({
+                        'loss': f'{loss.item():.6f}',
+                        'ETA': f'{left_time / 60:.1f}m'
+                    })
+                    iter_count = 0
+                    time_now = time.time()
+
+                if self.args.use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(model_optim)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    model_optim.step()
+
+            batch_pbar.close()
+
+            epoch_time_used = time.time() - epoch_time
+            train_loss_avg = np.average(train_loss)
+
+            vali_loss = self.vali(vali_data, vali_loader, criterion)
+            test_loss = self.vali(test_data, test_loader, criterion)
+
+            train_losses.append(train_loss_avg)
+            val_losses.append(vali_loss)
+            test_losses.append(test_loss)
+
+            elapsed_time = time.time() - start_time
+            avg_epoch_time = elapsed_time / (epoch + 1)
+            remaining_epochs = self.args.train_epochs - epoch - 1
+            total_remaining_time = avg_epoch_time * remaining_epochs
+
+            epoch_pbar.set_postfix({
+                'Train': f'{train_loss_avg:.4f}',
+                'Val': f'{vali_loss:.4f}',
+                'Test': f'{test_loss:.4f}',
+                'ETA': f'{total_remaining_time / 60:.1f}m'
+            })
+            epoch_pbar.update(1)
+
+            print(
+                f"{epoch + 1:^6} | {train_loss_avg:^12.6f} | {vali_loss:^12.6f} | {test_loss:^12.6f} | {epoch_time_used:^8.1f}s | {total_remaining_time / 60:^10.1f}m")
+
+            early_stopping(vali_loss, self.model, path)
+            if early_stopping.early_stop:
+                print("-" * 80)
+                print("Early stopping triggered!")
+                print("-" * 80)
+                break
+
+            adjust_learning_rate(model_optim, epoch + 1, self.args)
+
+        epoch_pbar.close()
+
+        print("=" * 80)
+        print("Training Summary:")
+        print(f"Task ID: {getattr(self.args, 'task_id', 'default_task')}")
+        print(f"Best validation loss: {early_stopping.best_score:.6f}")
+        print(f"Final training loss: {train_losses[-1]:.6f}")
+        print(f"Final test loss: {test_losses[-1]:.6f}")
+        print("=" * 80)
+
+        best_model_path = path + '/' + 'checkpoint.pth'
+        self.model.load_state_dict(torch.load(best_model_path))
+
+        return self.model
+
+    def test(self, setting, test=0):
+        test_data, test_loader = self._get_data(flag='test')
+        if test:
+            print(f"Loading model from checkpoint for testing...")
+            model_path = self._get_task_id_path(self.args.checkpoints, setting)
+            self.model.load_state_dict(torch.load(os.path.join(model_path, 'checkpoint.pth')))
+
+            total_params, trainable_params = self._count_parameters(self.model)
+            print(f"Loaded model parameters: {total_params:,} total, {trainable_params:,} trainable")
+
+        # Run performance benchmark before testing
+        print("\nRunning performance benchmarks...")
+        benchmark_results = self.benchmark_performance(setting, test_loader)
+
+        preds = []
+        trues = []
+        
+        # Save test results using a path that includes task_id
+        folder_path = self._get_task_id_path('./test_results/', setting)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        self.model.eval()
+        with torch.no_grad():
+            test_pbar = tqdm(total=len(test_loader), desc='Testing')
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float().to(self.device)
+
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                f_dim = -1 if self.args.features == 'MS' else 0
+
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                outputs = outputs.detach().cpu().numpy()
+                batch_y = batch_y.detach().cpu().numpy()
+
+                pred = outputs
+                true = batch_y
+
+                preds.append(pred)
+                trues.append(true)
+
+                # Update test progress bar
+                test_pbar.update(1)
+
+                if i % 20 == 0:
+                    input = batch_x.detach().cpu().numpy()
+                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
+                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
+                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+
+            test_pbar.close()
+
+        preds = np.array(preds)
+        trues = np.array(trues)
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+
+        # result save (use a path that includes task_id)
+        folder_path = self._get_task_id_path('./results/', setting)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        mae, mse, rmse, mape, mspe = metric(preds, trues)
+
+        print("\n" + "=" * 50)
+        print("Test Results:")
+        print(f"Task ID: {getattr(self.args, 'task_id', 'default_task')}")
+        print(f"MSE: {mse:.6f}")
+        print(f"MAE: {mae:.6f}")
+        print(f"RMSE: {rmse:.6f}")
+        print(f"MAPE: {mape:.6f}")
+        print(f"MSPE: {mspe:.6f}")
+        print("=" * 50)
+
+        result_dir = self._get_task_id_path('./', '')
+        result_file = os.path.join(result_dir, 'result.txt')
+        if not os.path.exists(result_dir):
+            os.makedirs(result_dir)
+            
+        with open(result_file, 'a') as f:
+            f.write(f"Task ID: {getattr(self.args, 'task_id', 'default_task')} - {setting}  \n")
+            f.write(f'mse:{mse:.6f}, mae:{mae:.6f}, rmse:{rmse:.6f}, mape:{mape:.6f}, mspe:{mspe:.6f}')
+            f.write('\n')
+            f.write('\n')
+
+        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
+        np.save(folder_path + 'pred.npy', preds)
+        np.save(folder_path + 'true.npy', trues)
+
+        return
+
+    def predict(self, setting, load=False):
+        pred_data, pred_loader = self._get_data(flag='pred')
+
+        if load:
+
+            path = self._get_task_id_path(self.args.checkpoints, setting)
+            best_model_path = path + '/' + 'checkpoint.pth'
+            self.model.load_state_dict(torch.load(best_model_path))
+
+        preds = []
+
+        self.model.eval()
+        with torch.no_grad():
+            pred_pbar = tqdm(total=len(pred_loader), desc='Predicting')
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
+                batch_x = batch_x.float().to(self.device)
+                batch_y = batch_y.float()
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
+
+                # decoder input
+                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                # encoder - decoder
+                if self.args.use_amp:
+                    with torch.cuda.amp.autocast():
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                else:
+                    if self.args.output_attention:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                pred = outputs.detach().cpu().numpy()
+                preds.append(pred)
+
+                pred_pbar.update(1)
+
+            pred_pbar.close()
+
+        preds = np.array(preds)
+        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+
+        folder_path = self._get_task_id_path('./results/', setting)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        np.save(folder_path + 'real_prediction.npy', preds)
+
+        return
