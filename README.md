@@ -1,9 +1,12 @@
-# CQMTformer
+<img width="2492" height="1325" alt="image" src="https://github.com/user-attachments/assets/cfeb7618-175f-467f-a2e4-d6f8cd3f1f5e" /># CQMTformer
 If you would like to know more about this model, please refer to our paper.
 The manuscript has been accepted for publication in Expert Systems with Applications (ESWA). 
 
 Readers can access the article free of charge using the link provided below:
 https://www.sciencedirect.com/science/article/abs/pii/S0957417426028927
+
+If you want to download this paper, we recommend this link (but it lasts 50 days, before October 07, 2026):
+https://authors.elsevier.com/c/1ndYl3PiGTb8b-
 
 The DOI of the article belows:
 https://dpi.org/10.1016/j.eswa.2026.133986
