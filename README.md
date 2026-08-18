@@ -1,4 +1,4 @@
-<img width="2492" height="1325" alt="image" src="https://github.com/user-attachments/assets/cfeb7618-175f-467f-a2e4-d6f8cd3f1f5e" /># CQMTformer
+# CQMTformer
 If you would like to know more about this model, please refer to our paper.
 The manuscript has been accepted for publication in Expert Systems with Applications (ESWA). 
 
